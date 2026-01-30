@@ -1,0 +1,999 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Maple Runner (3 Levels - Curated v4)</title>
+  <style>
+    body { margin:0; background:#0b1220; display:grid; place-items:center; height:100vh; }
+    canvas { background:#111827; border-radius:14px; box-shadow:0 18px 60px rgba(0,0,0,.45); }
+    .hint { color:#cbd5e1; font-family:system-ui, sans-serif; margin-top:10px; font-size:13px; opacity:.9; line-height:1.35; }
+    b { color:#fff; }
+  </style>
+</head>
+<body>
+  <div>
+    <canvas id="c" width="960" height="540"></canvas>
+    <div class="hint">
+      이동: ←/→ 또는 A/D · 점프: Space/↑/W · 리셋: R(현재 레벨) · 레벨1부터: Shift+R<br/>
+      파일: <b>bg.png</b>, <b>ground.png</b>, <b>platform.png</b>, <b>spike.png</b>, <b>spike_2.png</b>, <b>spike_3.png</b>, <b>spike_3-1.png</b>,
+      <b>player.png</b>, <b>walk_1.png</b>, <b>walk_2.png</b>, <b>walk_3.png</b>, <b>jump.png</b>, <b>goal.gif</b>,
+      사운드: <b>bgm.mp3</b>, <b>sfx_jump.mp3</b>, <b>sfx_win.mp3</b>
+    </div>
+  </div>
+
+<script>
+(() => {
+  const canvas = document.getElementById("c");
+  const ctx = canvas.getContext("2d");
+  const W = canvas.width, H = canvas.height;
+
+  // =========================
+  // 튜닝값(너 세팅 유지)
+  // =========================
+  const BG_ZOOM = 1.5;
+
+  const GROUND_SCALE = 0.6;
+  const GROUND_DRAW_HEIGHT = 110;
+
+  const PLATFORM_SCALE = 0.22;
+  const PLATFORM_HIT_THICK = 18;
+  const PLATFORM_TOP_OFFSET = 50;
+  const PLATFORM_GAP_MARGIN = 24;
+
+  const PLAYER_RENDER_HEIGHT = 72;
+  const WALK_FPS = 7;
+  const WALK_SEQUENCE = [1,2,3,2];
+
+  const GOAL_SCALE = 1.0;
+  const GOAL_OFFSET_X = -20;
+  const GOAL_OFFSET_Y = +10;
+
+  const GRAVITY = 2400;
+  const MOVE_SPEED = 320;
+  const JUMP_V = 860;
+  const FRICTION = 0.86;
+
+  const GROUND_Y = 430;
+
+  const SNAP_CAMERA_TO_INT = true;
+  const camSnap = (v) => SNAP_CAMERA_TO_INT ? Math.round(v) : v;
+
+  // 지면 점프 가능한 hole 상한
+  const MAX_RUNNABLE_HOLE_W = 190;
+
+  // 짧은 지면 자동 제거
+  const MIN_GROUND_PIECE_W = 260;
+
+  // ✅ 안전장치: “의도치 않은 긴 gap”은 자동으로 메움(=gap에서 제외)
+  // (voidSegments로 명시된 퍼즐 구간은 예외)
+  const UNINTENDED_GAP_FILL_W = 260;
+
+  // 공중 장애물 애니
+  const FLY_ANIM_FPS = 10;
+  const FLY_BOB_AMP = 6;
+  const FLY_BOB_SPEED = 4.2;
+
+  const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+  function aabb(a, b) {
+    return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+  }
+
+  // =========================
+  // 입력
+  // =========================
+  const keys = new Set();
+  window.addEventListener("keydown", (e) => {
+    keys.add(e.code);
+    if (["ArrowUp","ArrowDown","ArrowLeft","ArrowRight","Space"].includes(e.code)) e.preventDefault();
+  }, { passive:false });
+  window.addEventListener("keyup", (e) => keys.delete(e.code));
+  const isDown = (...codes) => codes.some(c => keys.has(c));
+
+  // =========================
+  // Assets
+  // =========================
+  function loadImage(src) {
+    return new Promise((resolve) => {
+      const img = new Image();
+      img.src = src;
+      img.onload = () => resolve({ ok:true, img });
+      img.onerror = () => resolve({ ok:false, img:null });
+    });
+  }
+  function makeScaledPattern(img, scaleX, scaleY) {
+    const off = document.createElement("canvas");
+    off.width = Math.max(1, Math.round(img.width * scaleX));
+    off.height = Math.max(1, Math.round(img.height * scaleY));
+    const octx = off.getContext("2d");
+    octx.imageSmoothingEnabled = true;
+    octx.drawImage(img, 0, 0, off.width, off.height);
+    return { canvas: off, pattern: ctx.createPattern(off, "repeat") };
+  }
+
+  const assets = {
+    bg: { ok:false, img:null },
+    ground: { ok:false, img:null, pat:null, tileW:0, tileH:0 },
+    platform: { ok:false, img:null },
+    spike: { ok:false, img:null },
+    spike2: { ok:false, img:null },
+    spike3: { ok:false, img:null },
+    spike3b:{ ok:false, img:null },
+    goal: { ok:false, img:null },
+    idle: { ok:false, img:null },
+    walk1: { ok:false, img:null },
+    walk2: { ok:false, img:null },
+    walk3: { ok:false, img:null },
+    jump: { ok:false, img:null },
+  };
+
+  async function loadAssets() {
+    const [
+      bg, ground, platform,
+      spike, spike2, spike3, spike3b,
+      goalGif,
+      idle, w1, w2, w3, jump
+    ] = await Promise.all([
+      loadImage("bg.png"),
+      loadImage("ground.png"),
+      loadImage("platform.png"),
+      loadImage("spike.png"),
+      loadImage("spike_2.png"),
+      loadImage("spike_3.png"),
+      loadImage("spike_3-1.png"),
+      loadImage("goal.gif"),
+      loadImage("player.png"),
+      loadImage("walk_1.png"),
+      loadImage("walk_2.png"),
+      loadImage("walk_3.png"),
+      loadImage("jump.png"),
+    ]);
+
+    assets.bg = bg;
+    assets.ground.ok = ground.ok; assets.ground.img = ground.img;
+    assets.platform = platform;
+    assets.spike = spike;
+    assets.spike2 = spike2;
+    assets.spike3 = spike3;
+    assets.spike3b = spike3b;
+    assets.goal = goalGif;
+
+    assets.idle = idle;
+    assets.walk1 = w1;
+    assets.walk2 = w2;
+    assets.walk3 = w3;
+    assets.jump = jump;
+
+    if (assets.ground.ok) {
+      const p = makeScaledPattern(assets.ground.img, GROUND_SCALE, GROUND_SCALE);
+      assets.ground.pat = p.pattern;
+      assets.ground.tileW = p.canvas.width;
+      assets.ground.tileH = p.canvas.height;
+    }
+  }
+  loadAssets();
+
+  // =========================
+  // Audio
+  // =========================
+  let audioEnabled = false;
+  const bgm = new Audio("bgm.mp3");
+  bgm.loop = true;
+  bgm.volume = 0.45;
+
+  const sfxJump = new Audio("sfx_jump.mp3");
+  sfxJump.volume = 0.75;
+
+  const sfxWin = new Audio("sfx_win.mp3");
+  sfxWin.volume = 0.85;
+
+  function enableAudioOnce() {
+    if (audioEnabled) return;
+    audioEnabled = true;
+    bgm.play().catch(() => {});
+  }
+  function playSfx(a) {
+    if (!audioEnabled) return;
+    const c = a.cloneNode();
+    c.volume = a.volume;
+    c.play().catch(() => {});
+  }
+  window.addEventListener("pointerdown", enableAudioOnce);
+  window.addEventListener("keydown", enableAudioOnce);
+
+  // =========================
+  // Levels
+  // =========================
+  const levels = [
+    { name:"LEVEL 1", worldW: 5000, allow2:false, allow3:false },
+    { name:"LEVEL 2", worldW: 7000, allow2:true,  allow3:false },
+    { name:"LEVEL 3", worldW:10000, allow2:true,  allow3:true  },
+  ];
+  let levelIndex = 0;
+  let WORLD_W = levels[levelIndex].worldW;
+
+  const GOAL_PAD = 520;
+  const HOLE_SAFE_PAD = 110;
+  const GOAL_SAFE_ZONE = 650;
+
+  // ✅ 레벨2: “중간 긴 void”를 제거하고(=지면으로 연결),
+  // 퍼즐 구간은 1개([0.22,0.26])만 유지
+  const design = {
+    0: {
+      groundSegments: [
+        [0.00, 0.30],
+        [0.34, 1.00],
+      ],
+      holes: [
+        { xr:0.20, w:170 },
+        { xr:0.55, w:180 },
+        { xr:0.73, w:170 },
+      ],
+      voidSegments: [
+        [0.30, 0.34],
+      ],
+      platforms: [
+        { xr:0.295, y:330 },
+        { xr:0.315, y:300 },
+        { xr:0.335, y:330 },
+        { xr:0.46,  y:300 },
+      ],
+      spikes1: [{ xr:0.12 },{ xr:0.26 },{ xr:0.40 },{ xr:0.62 },{ xr:0.80 },{ xr:0.90 }],
+      movers: [],
+      flyers: []
+    },
+
+    1: {
+      groundSegments: [
+        [0.00, 0.22],
+        [0.26, 1.00], // ✅ 0.50~0.56 끊김이 아니라 지면 유지로 변경
+      ],
+      holes: [
+        { xr:0.20, w:170 },
+        { xr:0.48, w:180 },
+        { xr:0.78, w:180 },
+      ],
+      voidSegments: [
+        [0.22, 0.26], // ✅ 퍼즐 1개만
+      ],
+      platforms: [
+        { xr:0.215,y:330 }, { xr:0.235,y:295 }, { xr:0.258,y:330 },
+        { xr:0.66, y:295 }, // 포인트 발판
+      ],
+      spikes1: [{ xr:0.12 },{ xr:0.34 },{ xr:0.44 },{ xr:0.64 },{ xr:0.86 }],
+      movers: [
+        { xr:0.40, type:"ground" },
+        { xr:0.66, type:"ground" },
+        { xr:0.88, type:"ground" },
+        { xr:0.235, type:"platform", nearPlatformXr:0.235 },
+      ],
+      flyers: []
+    },
+
+    2: {
+      groundSegments: [
+        [0.00, 0.18],
+        [0.22, 0.40],
+        [0.46, 0.62],
+        [0.68, 0.82],
+        [0.88, 1.00],
+      ],
+      holes: [
+        { xr:0.17, w:170 },
+        { xr:0.44, w:180 },
+        { xr:0.66, w:180 },
+        { xr:0.86, w:170 },
+      ],
+      voidSegments: [
+        [0.18, 0.22],
+        [0.40, 0.46],
+        [0.62, 0.68],
+      ],
+      platforms: [
+        { xr:0.175,y:330 }, { xr:0.195,y:295 }, { xr:0.218,y:330 },
+        { xr:0.39, y:330 }, { xr:0.415,y:300 }, { xr:0.44, y:330 }, { xr:0.465,y:300 },
+        { xr:0.615,y:330 }, { xr:0.645,y:295 }, { xr:0.675,y:330 },
+        { xr:0.80, y:295 },
+      ],
+      spikes1: [{ xr:0.10 },{ xr:0.30 },{ xr:0.52 },{ xr:0.74 },{ xr:0.92 }],
+      movers: [
+        { xr:0.28, type:"ground" },
+        { xr:0.54, type:"ground" },
+        { xr:0.76, type:"ground" },
+        { xr:0.645, type:"platform", nearPlatformXr:0.645 },
+      ],
+      flyers: [
+        { xr:0.16, y:250 },
+        { xr:0.43, y:235 },
+        { xr:0.47, y:265 },
+        { xr:0.67, y:245 },
+        { xr:0.81, y:235 },
+      ]
+    }
+  };
+
+  // =========================
+  // World runtime
+  // =========================
+  let goal = { x: WORLD_W - 260, y: GROUND_Y - 140, w: 110, h: 140 };
+  let gapRanges = [];
+  let platforms = [];
+  let spikes = [];
+  let movingHazards = [];
+  let flyingSpikes = [];
+  let groundSegs = [];
+  let voidRanges = []; // 현재 레벨 void px 저장
+
+  function mergeRanges(ranges) {
+    const rs = ranges
+      .map(r => ({ x: Math.max(0, r.x), w: Math.max(0, r.w) }))
+      .filter(r => r.w > 0)
+      .sort((a,b) => a.x - b.x);
+
+    const out = [];
+    for (const r of rs) {
+      const end = r.x + r.w;
+      if (!out.length) { out.push({ ...r }); continue; }
+      const last = out[out.length - 1];
+      const lastEnd = last.x + last.w;
+      if (r.x <= lastEnd) last.w = Math.max(lastEnd, end) - last.x;
+      else out.push({ ...r });
+    }
+    return out;
+  }
+  function inRanges(ranges, x) { return ranges.some(r => x >= r.x && x <= r.x + r.w); }
+  function groundExistsAt(x) { return !inRanges(gapRanges, x); }
+
+  function inGapSafePad(x) {
+    for (const g of gapRanges) {
+      const a = g.x - HOLE_SAFE_PAD;
+      const b = g.x + g.w + HOLE_SAFE_PAD;
+      if (x >= a && x <= b) return true;
+    }
+    return false;
+  }
+  function inGoalSafeZone(x) { return x >= (goal.x - GOAL_SAFE_ZONE); }
+
+  function getPlatformRenderSize() {
+    if (!assets.platform.ok) return { rw: 260, rh: 160 };
+    return {
+      rw: Math.round(assets.platform.img.width * PLATFORM_SCALE),
+      rh: Math.round(assets.platform.img.height * PLATFORM_SCALE),
+    };
+  }
+
+  function resolvePlatformOverlapsStrict(list) {
+    const { rw } = getPlatformRenderSize();
+    const minGap = rw + PLATFORM_GAP_MARGIN;
+    const sorted = [...list].map(p => ({...p})).sort((a,b) => a.cx - b.cx);
+
+    for (let pass=0; pass<10; pass++) {
+      let moved = false;
+      for (let i=1; i<sorted.length; i++) {
+        const prev = sorted[i-1], cur = sorted[i];
+        if (cur.cx - prev.cx < minGap) {
+          cur.cx = prev.cx + minGap;
+          moved = true;
+        }
+      }
+      for (const p of sorted) p.cx = clamp(p.cx, 80, WORLD_W - 80);
+      if (!moved) break;
+    }
+    return sorted;
+  }
+
+  function findPlatformNearX(x, tol=320) {
+    for (const p of platforms) if (Math.abs((p.cx) - x) <= tol) return p;
+    return null;
+  }
+
+  function computeGapsFromGroundSegments(groundSegsPx) {
+    const gs = [...groundSegsPx].sort((p,q)=>p.start-q.start);
+    const gaps = [];
+    let cur = 0;
+    for (const s of gs) {
+      if (s.start > cur) gaps.push({ x: cur, w: s.start - cur });
+      cur = Math.max(cur, s.end);
+    }
+    if (cur < WORLD_W) gaps.push({ x: cur, w: WORLD_W - cur });
+    return gaps;
+  }
+
+  function removeTinyGroundPieces() {
+    const gaps = [...gapRanges].sort((a,b)=>a.x-b.x);
+    const groundPieces = [];
+    let cur = 0;
+    for (const g of gaps) {
+      if (g.x > cur) groundPieces.push({ x: cur, w: g.x - cur });
+      cur = Math.max(cur, g.x + g.w);
+    }
+    if (cur < WORLD_W) groundPieces.push({ x: cur, w: WORLD_W - cur });
+
+    const tinyAsGaps = groundPieces
+      .filter(p => p.w > 0 && p.w < MIN_GROUND_PIECE_W)
+      .map(p => ({ x: p.x, w: p.w }));
+
+    if (tinyAsGaps.length) gapRanges = mergeRanges([...gapRanges, ...tinyAsGaps]);
+  }
+
+  function overlapsAnyVoid(gap) {
+    const a = gap.x, b = gap.x + gap.w;
+    for (const v of voidRanges) {
+      const va = v.x, vb = v.x + v.w;
+      if (a < vb && b > va) return true;
+    }
+    return false;
+  }
+
+  // ✅ 의도치 않은 “긴 gap” 메우기: gapRanges에서 제거(=지면으로 보이게)
+  function fillUnintendedLongGaps() {
+    // long gaps 중 void와 겹치지 않는 것만 제거
+    const keep = [];
+    for (const g of gapRanges) {
+      if (g.w >= UNINTENDED_GAP_FILL_W && !overlapsAnyVoid(g)) {
+        // 제거(=메움)
+        continue;
+      }
+      keep.push(g);
+    }
+    gapRanges = mergeRanges(keep);
+  }
+
+  function buildLevelData() {
+    const d = design[levelIndex];
+    WORLD_W = levels[levelIndex].worldW;
+    goal = { x: WORLD_W - 260, y: GROUND_Y - 140, w: 110, h: 140 };
+
+    groundSegs = d.groundSegments.map(([a,b]) => ({
+      start: Math.round(a * WORLD_W),
+      end: Math.round(b * WORLD_W)
+    }));
+
+    const goalStart = Math.max(0, goal.x - GOAL_PAD);
+    const last = groundSegs[groundSegs.length - 1];
+    if (!last || last.end < goal.x) {
+      if (last && last.end >= goalStart) last.end = WORLD_W;
+      else groundSegs.push({ start: goalStart, end: WORLD_W });
+    }
+
+    const holes = d.holes.map(h => ({ x: Math.round(h.xr * WORLD_W), w: Math.min(h.w, MAX_RUNNABLE_HOLE_W) }));
+    voidRanges = d.voidSegments.map(([a,b]) => ({ x: Math.round(a * WORLD_W), w: Math.round((b-a) * WORLD_W) }));
+
+    const gapsFromGround = computeGapsFromGroundSegments(groundSegs);
+    gapRanges = mergeRanges([...gapsFromGround, ...holes, ...voidRanges]);
+
+    // ✅ 안전장치 적용(레벨2/3에서 “발판 없는 긴 hole” 방지)
+    fillUnintendedLongGaps();
+
+    removeTinyGroundPieces();
+
+    // platforms
+    const baseCenters = d.platforms.map(p => ({ cx: Math.round(p.xr * WORLD_W), topY: p.y }));
+    const fixed = resolvePlatformOverlapsStrict(baseCenters);
+    const { rw } = getPlatformRenderSize();
+    platforms = fixed.map(p => ({
+      cx: p.cx,
+      x: p.cx - rw/2,
+      y: p.topY,
+      w: rw,
+      h: PLATFORM_HIT_THICK
+    }));
+
+    removeTinyGroundPieces();
+
+    // spikes
+    function spikeAllowedAt(xCenter) {
+      if (!groundExistsAt(xCenter)) return false;
+      if (inGapSafePad(xCenter)) return false;
+      if (inGoalSafeZone(xCenter)) return false;
+      return true;
+    }
+    spikes = d.spikes1
+      .map(s => Math.round(s.xr * WORLD_W))
+      .map(x => ({ x, y: GROUND_Y - 26, w: 28, h: 26 }))
+      .filter(s => spikeAllowedAt(s.x + s.w*0.5));
+
+    // moving hazards
+    movingHazards = [];
+    if (levels[levelIndex].allow2) {
+      function clampSafeSegment(seg) {
+        let s = seg.start + 120;
+        let e = seg.end - 120;
+        e = Math.min(e, goal.x - GOAL_SAFE_ZONE);
+        if (e - s < 260) return null;
+        return { start:s, end:e };
+      }
+      function pickSegByX(segs, x) {
+        for (const seg of segs) if (x >= seg.start && x <= seg.end) return seg;
+        return null;
+      }
+      const safeGroundSegs = [...groundSegs].map(clampSafeSegment).filter(Boolean);
+
+      const speeds = [130, 150, 140, 125];
+      const phases = [0.2, 1.1, 0.6, 1.8];
+
+      let i = 0;
+      for (const m of d.movers) {
+        if (m.type === "ground") {
+          const anchorX = Math.round(m.xr * WORLD_W);
+          const seg = pickSegByX(safeGroundSegs, anchorX);
+          if (!seg) continue;
+          const pad = 50;
+          const segStart = seg.start + pad;
+          const segEnd = seg.end - pad;
+          if (segEnd - segStart < 240) continue;
+          movingHazards.push({
+            type:"ground",
+            segStart, segEnd,
+            y: GROUND_Y - 30,
+            w: 30, h: 30,
+            speed: speeds[i % speeds.length],
+            phase: phases[i % phases.length]
+          });
+          i++;
+        } else if (m.type === "platform") {
+          const targetX = Math.round(m.nearPlatformXr * WORLD_W);
+          const p = findPlatformNearX(targetX, 420);
+          if (!p) continue;
+          const margin = 40;
+          const segStart = p.x + margin;
+          const segEnd = (p.x + p.w) - margin;
+          if (segEnd - segStart < 140) continue;
+          movingHazards.push({
+            type:"platform",
+            segStart, segEnd,
+            y: p.y - 30,
+            w: 30, h: 30,
+            speed: 125,
+            phase: 1.8
+          });
+        }
+      }
+    }
+
+    // flying hazards
+    flyingSpikes = [];
+    if (levels[levelIndex].allow3) {
+      for (const f of d.flyers) {
+        const xCenter = Math.round(f.xr * WORLD_W);
+        if (xCenter < 120 || xCenter > WORLD_W - 120) continue;
+        if (inGoalSafeZone(xCenter)) continue;
+        flyingSpikes.push({
+          x: xCenter - 17, y: f.y, w: 34, h: 34,
+          seed: (xCenter % 97) / 97
+        });
+      }
+    }
+  }
+
+  // =========================
+  // Player / state
+  // =========================
+  const player = {
+    x: 80, y: GROUND_Y - 64,
+    w: 42, h: 64,
+    vx: 0, vy: 0,
+    onGround: false,
+    face: 1,
+    walkTime: 0,
+  };
+
+  let state = "countdown";
+  let winTime = 0;
+  let timeSec = 0;
+
+  let countdownT = 0;
+  const COUNTDOWN_SEC = 3.0;
+
+  function startCountdown() {
+    state = "countdown";
+    countdownT = 0;
+    player.vx = 0; player.vy = 0;
+  }
+
+  function resetCurrentLevel() {
+    player.x = 80;
+    player.y = GROUND_Y - player.h;
+    player.vx = 0; player.vy = 0;
+    player.onGround = false;
+    player.face = 1;
+    player.walkTime = 0;
+    startCountdown();
+  }
+
+  function startLevel(idx) {
+    levelIndex = clamp(idx, 0, levels.length - 1);
+    buildLevelData();
+    resetCurrentLevel();
+  }
+
+  function startGameFromLevel1() {
+    startLevel(0);
+    winTime = 0;
+    timeSec = 0;
+  }
+
+  function pickPlayerFrame(dt) {
+    const speed = Math.abs(player.vx);
+    const moving = speed > 40;
+
+    if (!player.onGround && assets.jump.ok) return assets.jump.img;
+
+    if (player.onGround && moving && assets.walk1.ok && assets.walk2.ok && assets.walk3.ok) {
+      player.walkTime += dt;
+      const step = Math.floor(player.walkTime * WALK_FPS) % WALK_SEQUENCE.length;
+      const frame = WALK_SEQUENCE[step];
+      if (frame === 1) return assets.walk1.img;
+      if (frame === 2) return assets.walk2.img;
+      return assets.walk3.img;
+    }
+
+    player.walkTime = 0;
+    return assets.idle.ok ? assets.idle.img : null;
+  }
+
+  function resolveLanding(prevBottom, currBottom) {
+    player.onGround = false;
+
+    for (const p of platforms) {
+      const overlapX = (player.x + player.w) > p.x && player.x < (p.x + p.w);
+      const crossedY = prevBottom <= p.y && currBottom >= p.y;
+      if (player.vy >= 0 && overlapX && crossedY) {
+        player.y = p.y - player.h;
+        player.vy = 0;
+        player.onGround = true;
+        return;
+      }
+    }
+
+    const midX = player.x + player.w * 0.5;
+    if (groundExistsAt(midX)) {
+      const crossedGround = prevBottom <= GROUND_Y && currBottom >= GROUND_Y;
+      if (player.vy >= 0 && crossedGround) {
+        player.y = GROUND_Y - player.h;
+        player.vy = 0;
+        player.onGround = true;
+      }
+    }
+  }
+
+  function pingpong(t, len) {
+    if (len <= 0) return 0;
+    const m = t % (2 * len);
+    return m <= len ? m : (2 * len - m);
+  }
+  function getMoverX(ms, t) {
+    const len = ms.segEnd - ms.segStart;
+    const traveled = pingpong((t + ms.phase) * ms.speed, len);
+    return ms.segStart + traveled;
+  }
+
+  function update(dt) {
+    if (isDown("KeyR") && (isDown("ShiftLeft") || isDown("ShiftRight"))) startGameFromLevel1();
+    else if (isDown("KeyR")) resetCurrentLevel();
+
+    timeSec += dt;
+
+    if (state === "gameDone") return;
+
+    if (state === "winTransition") {
+      winTime += dt;
+      player.vx = 0; player.vy = 0;
+      if (winTime >= 1.0) {
+        winTime = 0;
+        if (levelIndex < levels.length - 1) startLevel(levelIndex + 1);
+        else state = "gameDone";
+      }
+      return;
+    }
+
+    if (state === "dead") return;
+
+    if (state === "countdown") {
+      countdownT += dt;
+      if (countdownT >= COUNTDOWN_SEC) state = "play";
+      return;
+    }
+
+    const left  = isDown("ArrowLeft","KeyA");
+    const right = isDown("ArrowRight","KeyD");
+
+    if (left) { player.vx = -MOVE_SPEED; player.face = -1; }
+    else if (right) { player.vx = MOVE_SPEED; player.face = 1; }
+    else player.vx *= FRICTION;
+
+    if (player.onGround && isDown("Space","ArrowUp","KeyW")) {
+      player.vy = -JUMP_V;
+      player.onGround = false;
+      playSfx(sfxJump);
+    }
+
+    const prevBottom = player.y + player.h;
+
+    player.vy += GRAVITY * dt;
+    player.x += player.vx * dt;
+    player.y += player.vy * dt;
+
+    player.x = clamp(player.x, 0, WORLD_W - player.w);
+
+    const currBottom = player.y + player.h;
+    resolveLanding(prevBottom, currBottom);
+
+    for (const s of spikes) if (aabb(player, s)) state = "dead";
+
+    if (levels[levelIndex].allow2) {
+      for (const ms of movingHazards) {
+        const xWorld = getMoverX(ms, timeSec);
+        const hit = { x: xWorld, y: ms.y, w: ms.w, h: ms.h };
+        if (aabb(player, hit)) state = "dead";
+      }
+    }
+
+    if (levels[levelIndex].allow3) {
+      for (const f of flyingSpikes) if (aabb(player, f)) state = "dead";
+    }
+
+    if (player.y > H + 250) state = "dead";
+
+    if (aabb(player, goal)) {
+      state = "winTransition";
+      winTime = 0;
+      playSfx(sfxWin);
+    }
+  }
+
+  // =========================
+  // Render
+  // =========================
+  function drawBackground(camX) {
+    if (!assets.bg.ok) {
+      ctx.fillStyle = "#0b1220";
+      ctx.fillRect(0,0,W,H);
+      return;
+    }
+    const img = assets.bg.img;
+    const canvasAR = W / H;
+
+    let viewW = img.width / BG_ZOOM;
+    let viewH = viewW / canvasAR;
+
+    if (viewH > img.height) {
+      viewH = img.height / BG_ZOOM;
+      viewW = viewH * canvasAR;
+    }
+
+    const maxSX = Math.max(0, img.width - viewW);
+    const norm = (WORLD_W - W) > 0 ? (camX / (WORLD_W - W)) : 0;
+    const sx = Math.round(clamp(norm * maxSX, 0, maxSX));
+    const sy = Math.round((img.height - viewH) / 2);
+
+    ctx.imageSmoothingEnabled = true;
+    ctx.drawImage(img, sx, sy, viewW, viewH, 0, 0, W, H);
+  }
+
+  function buildGroundDrawSegs() {
+    const gaps = [...gapRanges].sort((a,b)=>a.x-b.x);
+    const segs = [];
+    let cur = 0;
+    for (const g of gaps) {
+      if (g.x > cur) segs.push({ x: cur, w: g.x - cur });
+      cur = Math.max(cur, g.x + g.w);
+    }
+    if (cur < WORLD_W) segs.push({ x: cur, w: WORLD_W - cur });
+    return segs;
+  }
+
+  function drawGround(camX) {
+    const segs = buildGroundDrawSegs();
+    for (const seg of segs) {
+      const sx = seg.x - camX;
+      const sy = GROUND_Y;
+      const sw = seg.w;
+      const sh = H - GROUND_Y;
+      if (sx > W || sx + sw < 0) continue;
+
+      ctx.fillStyle = "#1f2937";
+      ctx.fillRect(Math.round(sx), sy, sw, sh);
+
+      if (assets.ground.ok && assets.ground.pat) {
+        ctx.save();
+        ctx.imageSmoothingEnabled = true;
+
+        const texH = Math.min(GROUND_DRAW_HEIGHT, sh);
+        ctx.beginPath();
+        ctx.rect(Math.round(sx), sy, sw, texH);
+        ctx.clip();
+
+        const ox = -Math.round(camX % assets.ground.tileW);
+        ctx.translate(ox, sy);
+
+        ctx.fillStyle = assets.ground.pat;
+        ctx.fillRect(-assets.ground.tileW, 0, W + assets.ground.tileW * 2, texH);
+
+        ctx.restore();
+      }
+    }
+  }
+
+  function drawPlatforms(camX) {
+    const { rw, rh } = getPlatformRenderSize();
+    for (const p of platforms) {
+      const drawX = Math.round(p.cx - camX - rw/2);
+      const drawY = Math.round(p.y - (rh - PLATFORM_TOP_OFFSET));
+      if (assets.platform.ok) {
+        ctx.imageSmoothingEnabled = true;
+        ctx.drawImage(assets.platform.img, drawX, drawY, rw, rh);
+      }
+    }
+  }
+
+  function drawHazards(camX) {
+    for (const s of spikes) {
+      const x = Math.round(s.x - camX), y = Math.round(s.y);
+      if (assets.spike.ok) {
+        ctx.imageSmoothingEnabled = true;
+        ctx.drawImage(assets.spike.img, x, y, s.w, s.h);
+      }
+    }
+
+    if (levels[levelIndex].allow2) {
+      for (const ms of movingHazards) {
+        const xWorld = getMoverX(ms, timeSec);
+        const x = Math.round(xWorld - camX);
+        const y = Math.round(ms.y);
+        if (assets.spike2.ok) {
+          ctx.imageSmoothingEnabled = true;
+          ctx.drawImage(assets.spike2.img, x, y, ms.w, ms.h);
+        }
+      }
+    }
+
+    if (levels[levelIndex].allow3) {
+      const toggle = (Math.floor(timeSec * FLY_ANIM_FPS) % 2) === 1;
+      const imgA = assets.spike3.ok ? assets.spike3.img : null;
+      const imgB = assets.spike3b.ok ? assets.spike3b.img : null;
+      const flyImg = (toggle && imgB) ? imgB : imgA;
+
+      if (flyImg) {
+        for (const f of flyingSpikes) {
+          const x = Math.round(f.x - camX);
+          const bob = Math.sin((timeSec + (f.seed ?? 0)) * FLY_BOB_SPEED) * FLY_BOB_AMP;
+          const y = Math.round(f.y + bob);
+          ctx.imageSmoothingEnabled = true;
+          ctx.drawImage(flyImg, x, y, f.w, f.h);
+        }
+      }
+    }
+  }
+
+  function drawGoal(camX) {
+    if (!assets.goal.ok) return;
+    const gw = Math.round(assets.goal.img.width * GOAL_SCALE);
+    const gh = Math.round(assets.goal.img.height * GOAL_SCALE);
+
+    const drawX = Math.round(goal.x - camX) + GOAL_OFFSET_X;
+    const drawY = Math.round(GROUND_Y - gh) + GOAL_OFFSET_Y;
+
+    ctx.imageSmoothingEnabled = true;
+    ctx.drawImage(assets.goal.img, drawX, drawY, gw, gh);
+  }
+
+  function drawPlayer(camX, dt) {
+    const img = pickPlayerFrame(dt);
+    if (!img) return;
+
+    const centerX = (player.x + player.w/2) - camX;
+    const bottomY = (player.y + player.h);
+
+    const scale = PLAYER_RENDER_HEIGHT / img.height;
+    const renderW = Math.round(img.width * scale);
+    const renderH = Math.round(img.height * scale);
+
+    const drawX = Math.round(centerX - renderW/2);
+    const drawY = Math.round(bottomY - renderH);
+
+    ctx.save();
+    ctx.translate(Math.round(centerX), 0);
+    ctx.scale(player.face, 1);
+    ctx.translate(-Math.round(centerX), 0);
+
+    ctx.imageSmoothingEnabled = false;
+    ctx.drawImage(img, drawX, drawY, renderW, renderH);
+    ctx.restore();
+  }
+
+  function drawUI() {
+    ctx.fillStyle = "rgba(255,255,255,.95)";
+    ctx.font = "14px system-ui, sans-serif";
+    ctx.fillText(`${levels[levelIndex].name} (길이 ${WORLD_W})`, 18, 28);
+
+    ctx.font = "12px system-ui, sans-serif";
+    ctx.fillText(`spike_1: ON  spike_2: ${levels[levelIndex].allow2 ? "ON":"OFF"}  spike_3: ${levels[levelIndex].allow3 ? "ON":"OFF"}`, 18, 48);
+
+    if (state === "dead") {
+      ctx.fillStyle = "rgba(0,0,0,.55)";
+      ctx.fillRect(0,0,W,H);
+      ctx.fillStyle = "#fff";
+      ctx.font = "32px system-ui, sans-serif";
+      ctx.textAlign = "center";
+      ctx.fillText("실패! R로 현재 레벨 재시작", W/2, H/2);
+      ctx.font = "14px system-ui, sans-serif";
+      ctx.fillText("Shift+R: 레벨1부터", W/2, H/2 + 26);
+      ctx.textAlign = "left";
+    }
+
+    if (state === "winTransition") {
+      ctx.fillStyle = "rgba(0,0,0,.25)";
+      ctx.fillRect(0,0,W,H);
+      ctx.fillStyle = "rgba(255,255,255,.95)";
+      ctx.font = "44px system-ui, sans-serif";
+      ctx.textAlign = "center";
+      ctx.fillText("CLEAR!", W/2, H/2 - 6);
+      ctx.font = "16px system-ui, sans-serif";
+      ctx.fillText(levelIndex < levels.length - 1 ? "다음 라운드로 이동..." : "전체 클리어!", W/2, H/2 + 22);
+      ctx.textAlign = "left";
+    }
+
+    if (state === "gameDone") {
+      ctx.fillStyle = "rgba(0,0,0,.55)";
+      ctx.fillRect(0,0,W,H);
+      ctx.fillStyle = "#fff";
+      ctx.font = "40px system-ui, sans-serif";
+      ctx.textAlign = "center";
+      ctx.fillText("ALL CLEAR!", W/2, H/2 - 8);
+      ctx.font = "16px system-ui, sans-serif";
+      ctx.fillText("R: 마지막 레벨 재시작 / Shift+R: 레벨1부터", W/2, H/2 + 24);
+      ctx.textAlign = "left";
+    }
+
+    if (state === "countdown") {
+      const remain = Math.max(0, 3.0 - countdownT);
+      const n = Math.ceil(remain);
+      ctx.fillStyle = "rgba(0,0,0,.35)";
+      ctx.fillRect(0,0,W,H);
+
+      ctx.fillStyle = "rgba(255,255,255,.96)";
+      ctx.textAlign = "center";
+      ctx.font = "56px system-ui, sans-serif";
+      ctx.fillText(n <= 0 ? "GO!" : `${n}`, W/2, H/2);
+
+      ctx.font = "16px system-ui, sans-serif";
+      ctx.fillText(`${levels[levelIndex].name} 시작`, W/2, H/2 + 34);
+      ctx.textAlign = "left";
+    }
+  }
+
+  // =========================
+  // Init + main loop
+  // =========================
+  function init() { startGameFromLevel1(); }
+  init();
+
+  let last = performance.now();
+  function loop(t) {
+    const dt = Math.min(0.033, (t - last)/1000);
+    last = t;
+
+    update(dt);
+
+    const camTarget = clamp(player.x - W*0.35, 0, WORLD_W - W);
+    const camX = camSnap(camTarget);
+
+    ctx.setTransform(1,0,0,1,0,0);
+    ctx.clearRect(0,0,W,H);
+
+    drawBackground(camX);
+    drawGround(camX);
+    drawPlatforms(camX);
+    drawHazards(camX);
+    drawGoal(camX);
+    drawPlayer(camX, dt);
+    drawUI();
+
+    requestAnimationFrame(loop);
+  }
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
